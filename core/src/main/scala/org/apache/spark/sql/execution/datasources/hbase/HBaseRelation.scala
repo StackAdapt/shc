@@ -13,6 +13,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * File modified by Hortonworks, Inc. Modifications are also licensed under
+ * the Apache Software License, Version 2.0.
  */
 
 package org.apache.spark.sql.execution.datasources.hbase
@@ -77,6 +80,7 @@ case class HBaseRelation(
   val minStamp = parameters.get(HBaseRelation.MIN_STAMP).map(_.toLong)
   val maxStamp = parameters.get(HBaseRelation.MAX_STAMP).map(_.toLong)
   val maxVersions = parameters.get(HBaseRelation.MAX_VERSIONS).map(_.toInt)
+  val mergeToLatest = parameters.get(HBaseRelation.MERGE_TO_LATEST).map(_.toBoolean).getOrElse(true)
 
   val catalog = HBaseTableCatalog(parameters)
 
@@ -152,6 +156,7 @@ case class HBaseRelation(
       cfs.foreach { x =>
         val cf = new HColumnDescriptor(x.getBytes())
         logDebug(s"add family $x to ${catalog.name}")
+        maxVersions.foreach(v => cf.setMaxVersions(v))
         tableDesc.addFamily(cf)
       }
       val startKey = catalog.shcTableCoder.toBytes("aaaaaaa")
@@ -168,6 +173,50 @@ case class HBaseRelation(
 
     admin.close()
     connection.close()
+  }
+
+  private def convertToPut(rkFields: Seq[Field])(row: Row) = {
+    val rkIdxedFields: Seq[(Int, Field)] = rkFields.map{ case x =>
+      (schema.fieldIndex(x.colName), x)
+    }
+    val colsIdxedFields = schema
+      .fieldNames
+      .partition( x => rkFields.map(_.colName).contains(x))
+      ._2.map(x => (schema.fieldIndex(x), catalog.getField(x)))
+
+    val coder = catalog.shcTableCoder
+    // construct bytes for row key
+    val rBytes =
+      if (isComposite()) {
+        val rowBytes = coder.encodeCompositeRowKey(rkIdxedFields, row)
+
+        val rLen = rowBytes.foldLeft(0) { case (x, y) =>
+          x + y.length
+        }
+        val rBytes = new Array[Byte](rLen)
+        var offset = 0
+        rowBytes.foreach { x =>
+          System.arraycopy(x, 0, rBytes, offset, x.length)
+          offset += x.length
+        }
+        rBytes
+      } else {
+        val rBytes = rkIdxedFields.map { case (x, y) =>
+          SHCDataTypeFactory.create(y).toBytes(row(x))
+        }
+        rBytes(0)
+      }
+    val put = timestamp.fold(new Put(rBytes))(new Put(rBytes, _))
+    colsIdxedFields.foreach { case (x, y) =>
+      val value = row(x)
+      if(value != null) {
+        put.addColumn(
+          coder.toBytes(y.cf),
+          coder.toBytes(y.col),
+          SHCDataTypeFactory.create(y).toBytes(value))
+      }
+    }
+    (new ImmutableBytesWritable, put)
   }
 
   /**
@@ -187,54 +236,12 @@ case class HBaseRelation(
       jobConfig.set("mapreduce.output.fileoutputformat.outputdir", tempDir.getPath + "/outputDataset")
     }
 
-    var count = 0
     val rkFields = catalog.getRowKey
-    val rkIdxedFields = rkFields.map{ case x =>
-      (schema.fieldIndex(x.colName), x)
-    }
-    val colsIdxedFields = schema
-      .fieldNames
-      .partition( x => rkFields.map(_.colName).contains(x))
-      ._2.map(x => (schema.fieldIndex(x), catalog.getField(x)))
     val rdd = data.rdd //df.queryExecution.toRdd
-
-    def convertToPut(row: Row) = {
-      val coder = catalog.shcTableCoder
-      // construct bytes for row key
-      val rBytes =
-        if (isComposite()) {
-          val rowBytes = coder.encodeCompositeRowKey(rkIdxedFields, row)
-
-          val rLen = rowBytes.foldLeft(0) { case (x, y) =>
-            x + y.length
-          }
-          val rBytes = new Array[Byte](rLen)
-          var offset = 0
-          rowBytes.foreach { x =>
-            System.arraycopy(x, 0, rBytes, offset, x.length)
-            offset += x.length
-          }
-          rBytes
-        } else {
-          val rBytes = rkIdxedFields.map { case (x, y) =>
-            SHCDataTypeFactory.create(y).toBytes(row(x))
-          }
-          rBytes(0)
-        }
-      val put = timestamp.fold(new Put(rBytes))(new Put(rBytes, _))
-      colsIdxedFields.foreach { case (x, y) =>
-        put.addColumn(
-          coder.toBytes(y.cf),
-          coder.toBytes(y.col),
-          SHCDataTypeFactory.create(y).toBytes(row(x)))
-      }
-      count += 1
-      (new ImmutableBytesWritable, put)
-    }
 
     rdd.mapPartitions(iter => {
       SHCCredentialsManager.processShcToken(serializedToken)
-      iter.map(convertToPut)
+      iter.map(convertToPut(rkFields))
     }).saveAsNewAPIHadoopDataset(jobConfig)
   }
 
@@ -319,6 +326,7 @@ object HBaseRelation {
   val TIMESTAMP = "timestamp"
   val MIN_STAMP = "minStamp"
   val MAX_STAMP = "maxStamp"
+  val MERGE_TO_LATEST = "mergeToLatest"
   val MAX_VERSIONS = "maxVersions"
   val HBASE_CONFIGURATION = "hbaseConfiguration"
   // HBase configuration file such as HBase-site.xml, core-site.xml
